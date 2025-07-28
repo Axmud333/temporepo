@@ -8,4 +8,7 @@ httpx
 pytest
 qdrant-client
 psycopg2-binary
-torch
+pyyaml
+sqlalchemy 
+aiosqlite 
+flake8

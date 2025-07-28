@@ -3,8 +3,19 @@ from dotenv import load_dotenv
 from openai import OpenAI
 
 load_dotenv()
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
+def get_api_key():
+	api_key=os.getenv("OPENAI_API_KEY")
+	if api_key:
+		return api_key
+	
+	try:
+		with open("/etc/secrets/OPENAI_API_KEY", "r") as f:
+			return f.read().strip()
+	except FileNotFoundError:
+		raise RuntimeError("APi key not found")
+
+client = OpenAI(api_key=get_api_key())
 def ask_openai(prompt: str) -> str:
 
 

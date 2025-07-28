@@ -23,6 +23,7 @@ spec:
           cp -r /app/templates/* /shared/templates/
           cp -r /app/static/* /shared/static/
           echo "front-end files copied"
+
         volumeMounts:
         - name: frontend-files
           mountPath: /shared
@@ -30,16 +31,17 @@ spec:
       containers:
       - name: backend
         image: aramk0/back_end
-        env:
-        - name: OPENAI_API_KEY
-          value: 'FAKE-KEY24'
-        - name: ANTHROPIC_API_KEY
-          value: "FAKE-KEY42"
         ports:
         - containerPort: 8000
+
+
         volumeMounts:
         - name: frontend-files
           mountPath: /app/frontend
+        - name: secret-volume
+          # this is the path INSIDE THE CONTAINER at which the secret must be found check the api files
+          mountPath: /etc/secrets
+
         livenessProbe:
           initialDelaySeconds: 2
           periodSeconds: 5
@@ -48,6 +50,11 @@ spec:
           httpGet:
             path: /health
             port: 8000
+
+
       volumes:
       - name: frontend-files
         emptyDir: {}
+      - name: secret-volume
+        secret:
+          secretName: my-secret
