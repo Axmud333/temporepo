@@ -6,3 +6,6 @@ Jinja2
 dotenv
 httpx
 pytest
+qdrant-client
+psycopg2-binary
+torch
