@@ -12,3 +12,8 @@ pyyaml
 sqlalchemy 
 aiosqlite 
 flake8
+psycopg2-binary
+flake8
+python-multipart
+pydantic
+pydantic[email]
