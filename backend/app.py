@@ -14,6 +14,7 @@ from backend.database import SessionLocal, Info, init_db
 from backend.claude_api import ask_claude
 from chatgpt_api import ask_openai
 from email_service import send_feedback_email
+from backend.qdrant_search import qdrant_search
 
 load_dotenv()
 logging.basicConfig(filename='logs/chat_logs.txt', level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -95,13 +96,15 @@ async def health_check():
 @app.post("/chat")
 async def chat_api(msg: ChatMessage):
     try:
-        response = ask_claude(msg.message)
+        database = qdrant_search(msg.message)
+        response = ask_claude(msg.message, database=database)
         logging.info(f"User: {msg.message}")
         logging.info(f"Claude: {response}")
         return {"response": response, "source": "claude"}
     except Exception:
         try:
-            response = ask_openai(msg.message)
+            database = qdrant_search(msg.message)
+            response = ask_openai(msg.message, database=database)
             logging.info(f"OpenAI: {response}")
             return {"response": response, "source": "openai"}
         except Exception:
