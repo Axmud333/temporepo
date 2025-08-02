@@ -5,6 +5,7 @@ WORKDIR /app
 COPY backend/requirements.txt .
 RUN pip install --no-cache-dir --prefix=/packages -r requirements.txt
 
+
 FROM python:3.12-slim AS runner
 
 WORKDIR /app
