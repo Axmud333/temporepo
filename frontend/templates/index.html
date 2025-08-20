@@ -679,7 +679,7 @@ function sendExamplePrompt(promptIndex) {
   sendMessage(prompt);
 }
 
-// main send message function - UPDATED TO WORK WITH EXISTING BACKEND
+// main send message function - UPDATED TO WORK WITH EXISTING BACKEND - important donot change
 function sendMessage(customMessage = null) {
   const input = document.getElementById('messageInput');
   const sendButton = document.getElementById('sendButton');
@@ -730,7 +730,7 @@ function sendMessage(customMessage = null) {
     .then(data => {
       hideTypingIndicator();
       
-      // Update session ID if provided by backend
+      //session ID if provided by backend - future development 
       if (data.session_id) {
         sessionId = data.session_id;
       }
