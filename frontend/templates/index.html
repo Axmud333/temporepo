@@ -143,7 +143,7 @@ let currentLang = 'en';
 let faqOpen = false;
 let isAIResponding = false;
 let isTypingComplete = false;
-let sessionId = null; //  session ID for conversation continuity
+let sessionId = null; // Track session ID for conversation continuity
 
 // FAQ questions in both languages
 const faqQuestions = {
@@ -279,12 +279,12 @@ function updateInputState() {
     }
 }
 
-//Free scrolling during AI response ->> no forced scrolling
+//Free scrolling during AI response ->>. no forced scrolling
 function typeWriter(element, text, speed = 20, showCursor = true) {
     element.innerHTML = '';
     let i = 0;
     
-    
+    // User can now scroll freely during AI response
     let userHasScrolled = false;
     let isAtBottomBeforeTyping = isScrolledToBottom();
     
@@ -304,7 +304,119 @@ function typeWriter(element, text, speed = 20, showCursor = true) {
     isTypingComplete = false;
     updateInputState();
     
-    
+    // add cursor styles if not there
+    if (!document.querySelector('#cursor-style')) {
+        const style = document.createElement('style');
+        style.id = 'cursor-style';
+        style.textContent = `
+            .typing-cursor {
+                display: inline-block;
+                background-color: #333;
+                width: 2px;
+                height: 1.2em;
+                margin-left: 2px;
+                animation: blink 1s infinite;
+            }
+            @keyframes blink {
+                0%, 50% { opacity: 1; }
+                51%, 100% { opacity: 0; }
+            }
+            
+            .ai-response-header {
+                font-weight: bold;
+                font-size: 1.1em;
+                margin-bottom: 8px;
+                color: #2c3e50;
+                border-bottom: 2px solid #3498db;
+                padding-bottom: 5px;
+                display: inline-block;
+            }
+            
+            .message.assistant .message-content {
+                line-height: 1.6;
+            }
+            
+            /* disabled input styles */
+            .input-container.disabled {
+                opacity: 0.6;
+                pointer-events: none;
+            }
+            
+            .message-input:disabled {
+                background-color: #f5f5f5;
+                cursor: not-allowed;
+            }
+            
+            .send-button:disabled {
+                background-color: #ccc;
+                cursor: not-allowed;
+            }
+            
+            /* typing status */
+            .typing-status {
+                position: absolute;
+                top: -25px;
+                left: 50%;
+                transform: translateX(-50%);
+                background: rgba(52, 152, 219, 0.1);
+                color: #3498db;
+                padding: 5px 15px;
+                border-radius: 15px;
+                font-size: 12px;
+                font-weight: 500;
+                white-space: nowrap;
+                z-index: 100;
+            }
+            
+            /* Scroll to bottom indicator - REMOVED */
+            
+            /* Mobile adjustments */
+            @media (max-width: 768px) {
+                /* Mobile styles */
+            }
+            
+            /* RTL text - ONLY apply when content is actually Kurdish */
+            .rtl-text {
+                direction: rtl;
+                text-align: right;
+                font-family: 'Segoe UI', 'Tahoma', 'Arial Unicode MS', sans-serif;
+                line-height: 1.6;
+            }
+            
+            /* RTL message container */
+            .rtl-message {
+                direction: rtl;
+            }
+            
+            /* avatar position for RTL */
+            .rtl-message .message-avatar {
+                order: 2;
+                margin-left: 12px;
+                margin-right: 0;
+            }
+            
+            .rtl-message .message-content {
+                order: 1;
+            }
+            
+            /* fix lists for RTL */
+            .rtl-text ul, .rtl-text ol {
+                text-align: right;
+                direction: rtl;
+            }
+            
+            .rtl-text li {
+                text-align: right;
+            }
+            
+            /* Default LTR styling for English content */
+            .message.assistant .message-content:not(.rtl-text) {
+                direction: ltr;
+                text-align: left;
+            }
+        `;
+        document.head.appendChild(style);
+    }
     
     // add typing status
     const inputArea = document.getElementById('inputArea');
@@ -314,7 +426,7 @@ function typeWriter(element, text, speed = 20, showCursor = true) {
     typingStatus.textContent = currentLang === 'ku' ? '...هاوەڵ وەڵام دەداتەوە    ' : 'Haawall is responding...';
     inputArea.appendChild(typingStatus);
     
-    //تrack user scrolling without interfering
+    //Track user scrolling without interfering
     const messagesContainer = document.getElementById('messages');
     let scrollTimeout;
     
@@ -395,7 +507,7 @@ function typeWriter(element, text, speed = 20, showCursor = true) {
                     }
                     element.innerHTML = finalText;
                     
-                    //only scroll if user was at bottom and hasn't scrolled
+                    // Only scroll if user was at bottom and hasn't scrolled
                     if (isAtBottomBeforeTyping && !userHasScrolled) {
                         scrollToBottom();
                     }
@@ -618,7 +730,7 @@ function sendMessage(customMessage = null) {
     .then(data => {
       hideTypingIndicator();
       
-      // U session ID if provided by backend (forfuture development)
+      // Update session ID if provided by backend
       if (data.session_id) {
         sessionId = data.session_id;
       }
@@ -678,7 +790,7 @@ function addMessage(message, sender, isError = false) {
     content.classList.add('rtl-text');
     messageDiv.classList.add('rtl-message');
   } else {
-    //  ensure LTR for non-Kurdish content
+    // Explicitly ensure LTR for non-Kurdish content
     content.classList.remove('rtl-text');
     messageDiv.classList.remove('rtl-message');
   }
@@ -690,7 +802,7 @@ function addMessage(message, sender, isError = false) {
   // show user messages immediately
   if (sender === 'user') {
     content.innerHTML = formatMessage(message);
-    //  auto-scroll for user messages if they were at bottom
+    // Only auto-scroll for user messages if they were at bottom
     if (isScrolledToBottom()) {
         scrollToBottom();
     }
@@ -725,7 +837,7 @@ function scrollToBottom() {
     // force scroll to bottom
     messagesContainer.scrollTop = messagesContainer.scrollHeight;
     
-    //additional scroll for mobile - but only if needed
+    // Additional scroll for mobile - but only if needed
     if (window.innerWidth <= 768) {
       setTimeout(() => {
         if (isScrolledToBottom()) {
@@ -763,22 +875,8 @@ function hideTypingIndicator() {
   }
 }
 
-//  function to clear conversation session if needed
-function clearConversationSession() {
-  if (sessionId) {
-    fetch(`/chat/session/${sessionId}`, {
-      method: 'DELETE',
-    })
-    .then(response => response.json())
-    .then(data => {
-      console.log('Session cleared:', data);
-      sessionId = null;
-    })
-    .catch(error => {
-      console.error('Error clearing session:', error);
-    });
-  }
-}
+// Add function to clear conversation session if needed
+
 
 // switch between languages
 function toggleLanguage() {
@@ -867,7 +965,7 @@ function initializeMobileFixes() {
       // keyboard opened
       keyboardOpen = true;
       document.body.classList.add('keyboard-open');
-      //only auto-scroll if user was at bottom
+      // Only auto-scroll if user was at bottom
       if (isScrolledToBottom()) {
           setTimeout(() => scrollToBottom(), 300);
           setTimeout(() => scrollToBottom(), 600);
@@ -876,7 +974,7 @@ function initializeMobileFixes() {
       // keyboard closed
       keyboardOpen = false;
       document.body.classList.remove('keyboard-open');
-      //only auto-scroll if user was at bottom
+      // Only auto-scroll if user was at bottom
       if (isScrolledToBottom()) {
           setTimeout(() => scrollToBottom(), 300);
           setTimeout(() => scrollToBottom(), 600);
@@ -908,7 +1006,7 @@ function initializeIOSFixes() {
   // handle iOS keyboard hiding
   document.addEventListener('focusout', function(e) {
     if (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT') {
-      //  auto-scroll if user was at bottom
+      // Only auto-scroll if user was at bottom
       if (isScrolledToBottom()) {
           setTimeout(() => scrollToBottom(), 300);
       }
