@@ -320,8 +320,9 @@ async def chat_api(request: Request, msg: ChatMessage):
                 "session_id": session_id
             }
         
-        logging.info(f"Session {session_id[:8]}... - User: {msg.message[:100]}{'...' if len(msg.message) > 100 else ''}")
-        logging.info(f"Session {session_id[:8]}... - Claude: {response[:100]}{'...' if len(response) > 100 else ''}")
+        logging.info(f"Session {session_id[:8]} - User: {msg.message}")
+        logging.info(f"Session {session_id[:8]} - Claude: {response}")
+
         
         return {
             "response": response, 
