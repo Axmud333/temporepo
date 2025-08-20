@@ -12,11 +12,12 @@ import hashlib
 import re
 from contextlib import contextmanager
 from sqlalchemy.exc import SQLAlchemyError
-
+from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from backend.database import SessionLocal, Info, init_db
 from backend.claude_api import ask_claude, clear_cache, cleanup_cache
 from chatgpt_api import ask_openai
+from email_service import send_feedback_email
 
 load_dotenv()
 
@@ -26,6 +27,14 @@ app = FastAPI(docs_url=None, redoc_url=None)
 
 templates = Jinja2Templates(directory="frontend/templates")
 app.mount("/static", StaticFiles(directory="/app/frontend/static"), name="static")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 security = HTTPBearer()
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")
@@ -152,6 +161,27 @@ class InfoCreate(BaseModel):
                 raise ValueError(f"Invalid characters detected")
         
         return v.strip()
+    
+
+class FeedbackMessage(BaseModel):
+    name: str
+    email: str
+    category: Literal["feedback", "suggestion", "bug", "feature", "other"]
+    subject: str
+    message: str
+
+    @validator('name', 'email', 'subject', 'message')
+    def validate_not_empty(cls, v):
+        if not v.strip():
+            raise ValueError("Field cannot be empty")
+        return v.strip()
+
+    @validator('email')
+    def validate_email_format(cls, v):
+        import re
+        if not re.match(r'^[\w\.-]+@[\w\.-]+\.\w+$', v):
+            raise ValueError("Invalid email format")
+        return v
 
 @app.on_event("startup")
 async def startup():
@@ -226,10 +256,51 @@ async def chat_api(request: Request, msg: ChatMessage):
         except Exception as openai_error:
             logging.error(f"OpenAI fallback error: {str(openai_error)}")
             raise HTTPException(status_code=500, detail="AI services temporarily unavailable")
+        
+
+@app.post("/feedback")
+async def submit_feedback(request: Request, feedback: FeedbackMessage):
+    try:
+        # Rate limiting for feedback
+        client_ip = get_client_ip(request)
+        if not check_rate_limit(client_ip, limit=5, window=3600):  # 5 feedback per hour
+            raise HTTPException(
+                status_code=429, 
+                detail="Too many feedback submissions. Please try again later."
+            )
+        
+        send_feedback_email(
+            name=feedback.name,
+            email=feedback.email,
+            category=feedback.category,
+            subject=feedback.subject,
+            message=feedback.message
+        )
+        return JSONResponse(status_code=200, content={
+            "success": True,
+            "message": "Feedback sent successfully."
+        })
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Feedback error: {str(e)}")
+        return JSONResponse(status_code=500, content={
+            "success": False,
+            "message": "Unable to send feedback. Please try again later.",
+            "error_type": type(e).__name__
+        })
 
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
+
+@app.get("/about", response_class=HTMLResponse)
+async def about(request: Request):
+    return templates.TemplateResponse("about.html", {"request": request})
+
+@app.get("/contact", response_class=HTMLResponse)
+async def contact(request: Request):
+    return templates.TemplateResponse("contact.html", {"request": request})
 
 @app.post("/admin/info/add")
 async def add_info(request: Request, data: InfoCreate, _: HTTPAuthorizationCredentials = Depends(verify_admin_token)):
