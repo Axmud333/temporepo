@@ -46,7 +46,7 @@ rate_limit_storage: Dict[str, Dict] = {}
 # NEW: Conversation memory storage
 # Format: {session_id: {"messages": [{"role": "user/assistant", "content": "...", "timestamp": datetime}], "last_active": datetime}}
 conversation_memory: Dict[str, Dict] = {}
-MAX_CONVERSATION_HISTORY = 5  # Keep last 10 messages per session
+MAX_CONVERSATION_HISTORY = 5  # Keep last 5 messages per session
 CONVERSATION_TIMEOUT = 3600  # 1 hour timeout
 
 def cleanup_old_conversations():
