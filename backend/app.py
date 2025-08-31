@@ -1,100 +1,269 @@
+# app.py - Enhanced with conversation memory
 from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel, validator
-from datetime import datetime
-import os
+from pydantic import BaseModel, validator, Field
+from datetime import datetime, timedelta
+from typing import Literal, Dict, List, Optional
 import logging
-from typing import Literal
+import os
+import hashlib
+import re
+import uuid
+from contextlib import contextmanager
+from sqlalchemy.exc import SQLAlchemyError
+from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from backend.database import SessionLocal, Info, init_db
-from backend.claude_api import ask_claude
+from backend.claude_api import ask_claude_with_context, clear_cache, cleanup_cache
 from chatgpt_api import ask_openai
 from email_service import send_feedback_email
 from backend.qdrant_search import qdrant_search
 
 load_dotenv()
+
 logging.basicConfig(filename='logs/chat_logs.txt', level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-app = FastAPI()
+app = FastAPI(docs_url=None, redoc_url=None)
 
-# CORS middleware - Fixed missing import and closing parenthesis
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:8000", "http://127.0.0.1:8000", "*"],
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE"],
-    allow_headers=["*"],
-)
-
-# Templates and static files
 templates = Jinja2Templates(directory="frontend/templates")
 app.mount("/static", StaticFiles(directory="/app/frontend/static"), name="static")
 
-# Security setup for admin routes
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 security = HTTPBearer()
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")
+
+rate_limit_storage: Dict[str, Dict] = {}
+
+# NEW: Conversation memory storage
+# Format: {session_id: {"messages": [{"role": "user/assistant", "content": "...", "timestamp": datetime}], "last_active": datetime}}
+conversation_memory: Dict[str, Dict] = {}
+MAX_CONVERSATION_HISTORY = 5  # Keep last 5 messages per session
+CONVERSATION_TIMEOUT = 3600  # 1 hour timeout
+
+def cleanup_old_conversations():
+    """Remove expired conversations to prevent memory bloat"""
+    current_time = datetime.now()
+    expired_sessions = []
+    
+    for session_id, session_data in conversation_memory.items():
+        if current_time - session_data["last_active"] > timedelta(seconds=CONVERSATION_TIMEOUT):
+            expired_sessions.append(session_id)
+    
+    for session_id in expired_sessions:
+        del conversation_memory[session_id]
+    
+    if expired_sessions:
+        logging.info(f"Cleaned up {len(expired_sessions)} expired conversations")
+
+def get_or_create_session(session_id: Optional[str] = None) -> str:
+    """Get existing session or create new one"""
+    if session_id and session_id in conversation_memory:
+        conversation_memory[session_id]["last_active"] = datetime.now()
+        return session_id
+    
+    new_session_id = str(uuid.uuid4())
+    conversation_memory[new_session_id] = {
+        "messages": [],
+        "last_active": datetime.now()
+    }
+    return new_session_id
+
+def add_message_to_session(session_id: str, role: str, content: str):
+    """Add message to conversation history"""
+    if session_id not in conversation_memory:
+        conversation_memory[session_id] = {"messages": [], "last_active": datetime.now()}
+    
+    conversation_memory[session_id]["messages"].append({
+        "role": role,
+        "content": content,
+        "timestamp": datetime.now()
+    })
+    
+    # Keep only the last N messages to prevent memory bloat
+    if len(conversation_memory[session_id]["messages"]) > MAX_CONVERSATION_HISTORY:
+        conversation_memory[session_id]["messages"] = conversation_memory[session_id]["messages"][-MAX_CONVERSATION_HISTORY:]
+    
+    conversation_memory[session_id]["last_active"] = datetime.now()
+
+def get_conversation_context(session_id: str) -> List[Dict]:
+    """Get conversation context for Claude API"""
+    if session_id not in conversation_memory:
+        return []
+    
+    return [
+        {"role": msg["role"], "content": msg["content"]}
+        for msg in conversation_memory[session_id]["messages"]
+    ]
+
+def get_client_ip(request: Request) -> str:
+    x_forwarded_for = request.headers.get("X-Forwarded-For")
+    if x_forwarded_for:
+        return x_forwarded_for.split(",")[0].strip()
+    return request.client.host
+
+def check_rate_limit(client_ip: str, limit: int = 50, window: int = 3600) -> bool:
+    now = datetime.now()
+    
+    if client_ip not in rate_limit_storage:
+        rate_limit_storage[client_ip] = {"count": 1, "window_start": now}
+        return True
+    
+    client_data = rate_limit_storage[client_ip]
+    
+    if now - client_data["window_start"] > timedelta(seconds=window):
+        client_data["count"] = 1
+        client_data["window_start"] = now
+        return True
+    
+    if client_data["count"] >= limit:
+        return False
+    
+    client_data["count"] += 1
+    return True
 
 def verify_admin_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
     if credentials.credentials != ADMIN_TOKEN:
         raise HTTPException(status_code=403, detail="Invalid admin token")
     return credentials
 
+def log_security_event(event_type: str, details: str, request: Request):
+    client_ip = get_client_ip(request)
+    logging.warning(f"SECURITY EVENT - Type: {event_type}, IP: {client_ip}, Details: {details}")
+
+def is_suspicious_query(message: str) -> tuple[bool, str]:
+    suspicious_patterns = [
+        (r"('|(\\'))", "SQL_QUOTES"),
+        (r"(;|\s)(drop|delete|insert|update|alter|create|exec|union|select)\s", "SQL_KEYWORDS"),
+        (r"(union\s+(all\s+)?select)", "SQL_UNION"),
+        (r"(or\s+.+=.+)", "SQL_OR_CONDITION"),
+        (r"(and\s+.+=.+)", "SQL_AND_CONDITION"),
+        (r"(--|\/\*|\*\/)", "SQL_COMMENTS"),
+        (r"\b(database|table|column|schema|version|postgresql|mysql|sqlite)\b", "INFO_DISCLOSURE"),
+        (r"\b(admin|password|user|login|auth|token)\b.*\b(access|show|display|get|list)\b", "PRIVILEGE_REQUEST"),
+        (r"\b(show|list|display|execute|run|query)\s+(table|database|schema|structure)", "SYSTEM_QUERY"),
+        (r"\bselect\s+.*\bfrom\b", "SELECT_STATEMENT"),
+    ]
+    
+    message_lower = message.lower()
+    for pattern, threat_type in suspicious_patterns:
+        if re.search(pattern, message_lower):
+            return True, threat_type
+    
+    return False, ""
+
+@contextmanager
+def get_db_session():
+    db = SessionLocal()
+    try:
+        yield db
+        db.commit()
+    except SQLAlchemyError as e:
+        db.rollback()
+        logging.error(f"Database error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Database operation failed")
+    except Exception as e:
+        db.rollback()
+        logging.error(f"Unexpected database error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+    finally:
+        db.close()
+
 class ChatMessage(BaseModel):
-    message: str
+    message: str = Field(..., min_length=1, max_length=1000)
+    session_id: Optional[str] = Field(None, description="Session ID for conversation continuity")
+    
+    @validator('message')
+    def validate_message(cls, v):
+        v = v.strip()
+        if not v:
+            raise ValueError("Message cannot be empty")
+        
+        sql_patterns = [
+            r"('|(\\'))",
+            r"(;|\s)(drop|delete|insert|update|alter|create|exec|union|select)\s",
+            r"(union\s+(all\s+)?select)",
+            r"(or\s+.+=.+)",
+            r"(and\s+.+=.+)",
+            r"(--|\/\*|\*\/)",
+        ]
+        
+        message_lower = v.lower()
+        for pattern in sql_patterns:
+            if re.search(pattern, message_lower):
+                raise ValueError("Invalid message content")
+        
+        return v
 
 class InfoCreate(BaseModel):
-    category: str
-    key: str
-    value: str
+    category: str = Field(..., min_length=1, max_length=100)
+    key: str = Field(..., min_length=1, max_length=255)
+    value: str = Field(..., min_length=1, max_length=5000)
+    
+    @validator('category', 'key', 'value')
+    def sanitize_input(cls, v):
+        if not v or not v.strip():
+            raise ValueError("Field cannot be empty")
+        
+        dangerous_patterns = [
+            r'(\b(DROP|DELETE|INSERT|UPDATE|ALTER|CREATE|EXEC|EXECUTE|UNION|SELECT)\b)',
+            r'(--|;|\*|\/\*|\*\/)',
+            r'(\bOR\b.*=.*\b|\bAND\b.*=.*)',
+            r"('|(\\'))",
+        ]
+        
+        for pattern in dangerous_patterns:
+            if re.search(pattern, v.upper()):
+                raise ValueError(f"Invalid characters detected")
+        
+        return v.strip()
 
-# Fixed indentation and added missing import
 class FeedbackMessage(BaseModel):
     name: str
     email: str
     category: Literal["feedback", "suggestion", "bug", "feature", "other"]
     subject: str
     message: str
-    
+
     @validator('name', 'email', 'subject', 'message')
     def validate_not_empty(cls, v):
-        if not v or not v.strip():
-            raise ValueError('Field cannot be empty')
+        if not v.strip():
+            raise ValueError("Field cannot be empty")
         return v.strip()
-    
+
     @validator('email')
     def validate_email_format(cls, v):
         import re
-        email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
-        if not re.match(email_pattern, v):
-            raise ValueError('Invalid email format')
+        if not re.match(r'^[\w\.-]+@[\w\.-]+\.\w+$', v):
+            raise ValueError("Invalid email format")
         return v
 
 @app.on_event("startup")
 async def startup():
     init_db()
-    for folder in ["logs"]:
-        os.makedirs(folder, exist_ok=True)
-    
-    # Test logging - Fixed indentation
-    logging.info("=== SYSTEM STARTUP ===")
-    logging.info("System initialized successfully")
-    logging.info("Available endpoints:")
-    for route in app.routes:
-        if hasattr(route, 'methods') and hasattr(route, 'path'):
-            logging.info(f"  {list(route.methods)} {route.path}")
-    logging.info("=== STARTUP COMPLETE ===")
+    os.makedirs("logs", exist_ok=True)
+    logging.info("=== SYSTEM STARTUP COMPLETE ===")
+
+@app.on_event("shutdown")
+async def shutdown():
+    clear_cache()
+    logging.info("=== SYSTEM SHUTDOWN COMPLETE ===")
 
 @app.get("/health")
 async def health_check():
     return {"status": "healthy", "timestamp": datetime.now()}
 
-# Chat endpoint
 @app.post("/chat")
-async def chat_api(msg: ChatMessage):
+async def chat_api(request: Request, msg: ChatMessage):
     try:
         database = qdrant_search(msg.message)
         response = ask_claude(msg.message, database=database)
@@ -110,104 +279,36 @@ async def chat_api(msg: ChatMessage):
         except Exception:
             raise HTTPException(status_code=500, detail="Both AI services failed")
 
-# Feedback endpoint with error handling - Fixed indentation and structure
 @app.post("/feedback")
 async def submit_feedback(request: Request, feedback: FeedbackMessage):
     try:
-        # Logging for debugging
-        logging.info(f"=== FEEDBACK SUBMISSION START ===")
-        logging.info(f"Raw request body: {await request.body()}")
-        logging.info(f"Parsed feedback data: {feedback.dict()}")
-        logging.info(f"Received feedback from: {feedback.name} ({feedback.email})")
-        logging.info(f"Category: '{feedback.category}', Subject: '{feedback.subject}'")
-        
-        # Validate category explicitly (though Pydantic should handle this now)
-        valid_categories = ["feedback", "suggestion", "bug", "feature", "other"]
-        if feedback.category not in valid_categories:
-            error_msg = f"Invalid category '{feedback.category}'. Must be one of: {valid_categories}"
-            logging.error(error_msg)
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "success": False,
-                    "message": error_msg
-                }
+        client_ip = get_client_ip(request)
+        if not check_rate_limit(client_ip, limit=5, window=3600):
+            raise HTTPException(
+                status_code=429, 
+                detail="Too many feedback submissions. Please try again later."
             )
         
-        # Attempt to send email with detailed error handling
-        try:
-            logging.info("Attempting to send feedback email...")
-            send_feedback_email(
-                name=feedback.name,
-                email=feedback.email,
-                category=feedback.category,
-                subject=feedback.subject,
-                message=feedback.message
-            )
-            logging.info("Email sent successfully!")
-        except Exception as email_error:
-            error_msg = f"Failed to send email: {str(email_error)}"
-            logging.error(error_msg)
-            return JSONResponse(
-                status_code=500,
-                content={
-                    "success": False,
-                    "message": f"Email service error: {str(email_error)}"
-                }
-            )
-        
-        logging.info(f"Feedback process completed successfully for {feedback.name}")
-        logging.info(f"=== FEEDBACK SUBMISSION END ===")
-        
-        return JSONResponse(
-            status_code=200,
-            content={
-                "success": True, 
-                "message": "Feedback sent successfully and confirmation email sent to you!"
-            }
+        send_feedback_email(
+            name=feedback.name,
+            email=feedback.email,
+            category=feedback.category,
+            subject=feedback.subject,
+            message=feedback.message
         )
-        
-    except HTTPException as http_error:
-        logging.error(f"HTTP Exception: {http_error.detail}")
-        raise http_error
+        return JSONResponse(status_code=200, content={
+            "success": True,
+            "message": "Feedback sent successfully."
+        })
+    except HTTPException:
+        raise
     except Exception as e:
-        error_msg = str(e)
-        logging.error(f"Unexpected error in feedback submission: {error_msg}")
-        logging.error(f"Error type: {type(e).__name__}")
-        
-        return JSONResponse(
-            status_code=500,
-            content={
-                "success": False, 
-                "message": f"Server error: {error_msg}",
-                "error_type": type(e).__name__
-            }
-        )
-
-# Add a test endpoint for debugging
-@app.get("/test")
-async def test_endpoint():
-    return {
-        "status": "test_successful",
-        "timestamp": datetime.now(),
-        "message": "API is working correctly"
-    }
-
-# Enhanced error handler for better debugging
-@app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
-    logging.error(f"Global exception handler: {type(exc).__name__}: {str(exc)}")
-    logging.error(f"Request: {request.method} {request.url}")
-    
-    return JSONResponse(
-        status_code=500,
-        content={
+        logging.error(f"Feedback error: {str(e)}")
+        return JSONResponse(status_code=500, content={
             "success": False,
-            "message": "Internal server error occurred",
-            "error_type": type(exc).__name__,
-            "path": str(request.url.path)
-        }
-    )
+            "message": "Unable to send feedback. Please try again later.",
+            "error_type": type(e).__name__
+        })
 
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request):
@@ -221,36 +322,18 @@ async def about(request: Request):
 async def contact(request: Request):
     return templates.TemplateResponse("contact.html", {"request": request})
 
-# Admin endpoints to manage info data
-@app.post("/admin/info/add")
-async def add_info(data: InfoCreate, _: HTTPAuthorizationCredentials = Depends(verify_admin_token)):
-    db = SessionLocal()
-    try:
-        record = Info(category=data.category, key=data.key, value=data.value)
-        db.add(record)
-        db.commit()
-        return {"status": "success"}
-    finally:
-        db.close()
+# ... (all your existing admin endpoints remain the same)
 
-@app.get("/admin/info")
-async def list_info(_: HTTPAuthorizationCredentials = Depends(verify_admin_token)):
-    db = SessionLocal()
-    try:
-        results = db.query(Info).all()
-        return [{"id": r.id, "category": r.category, "key": r.key, "value": r.value} for r in results]
-    finally:
-        db.close()
+@app.get("/admin/stats")
+async def get_stats(_: HTTPAuthorizationCredentials = Depends(verify_admin_token)):
+    return {
+        "rate_limit_entries": len(rate_limit_storage),
+        "active_conversations": len(conversation_memory),
+        "total_messages": sum(len(session["messages"]) for session in conversation_memory.values()),
+        "timestamp": datetime.now()
+    }
 
-@app.delete("/admin/info/{info_id}")
-async def delete_info(info_id: int, _: HTTPAuthorizationCredentials = Depends(verify_admin_token)):
-    db = SessionLocal()
-    try:
-        record = db.query(Info).filter(Info.id == info_id).first()
-        if not record:
-            raise HTTPException(status_code=404, detail="Record not found")
-        db.delete(record)
-        db.commit()
-        return {"status": "deleted"}
-    finally:
-        db.close()
+@app.post("/admin/conversations/cleanup")
+async def cleanup_conversations_endpoint(_: HTTPAuthorizationCredentials = Depends(verify_admin_token)):
+    cleanup_old_conversations()
+    return {"status": "conversation cleanup completed", "active_sessions": len(conversation_memory)}

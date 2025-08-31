@@ -16,3 +16,4 @@ flake8
 python-multipart
 pydantic
 pydantic[email]
+numpy
